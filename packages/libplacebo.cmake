@@ -9,7 +9,8 @@ ExternalProject_Add(libplacebo
         glad
         fast_float
         xxhash
-    GIT_REPOSITORY https://github.com/haasn/libplacebo.git
+    # Fork: default branch carries the opaque composite alpha fix (also on branch opaque-composite-alpha)
+    GIT_REPOSITORY https://github.com/andrizan/libplacebo.git
     SOURCE_DIR ${SOURCE_LOCATION}
     GIT_CLONE_FLAGS "--filter=tree:0"
     GIT_SUBMODULES ""
