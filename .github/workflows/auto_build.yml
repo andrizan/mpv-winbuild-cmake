@@ -1,0 +1,322 @@
+name: auto build
+# Fork-only workflow. Every run checks out the latest shinchiro/mpv-winbuild-cmake,
+# overlays fork/patches with fork/apply.sh, builds mpv x86_64-v3 and publishes it as a
+# GitHub release of this repository. Upstream's own files are left untouched so the
+# fork can always be synced without conflicts.
+defaults:
+  run:
+    shell: bash
+
+on:
+  schedule:
+    # Tuesday and Friday 18:00 UTC (Wednesday and Saturday 01:00 WIB). Twice a week also
+    # keeps the caches below alive: GitHub drops caches that are unused for 7 days.
+    - cron: '0 18 * * 2,5'
+  workflow_dispatch:
+    inputs:
+      github_release:
+        description: 'Upload to Github release'
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: auto-build
+  cancel-in-progress: false
+
+jobs:
+  build_mpv:
+    name: Building mpv
+    runs-on: ubuntu-latest
+    env:
+      BIT: x86_64_v3
+    container:
+      image: docker://ghcr.io/shinchiro/archlinux:latest
+    steps:
+      - name: Setup git config
+        run: |
+          git config --global user.name "github-actions"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --global pull.rebase true
+          git config --global rebase.autoStash true
+          git config --global fetch.prune true
+          git config --global --add safe.directory $PWD
+
+      - name: Checking out upstream build recipes
+        uses: actions/checkout@main
+        with:
+          repository: shinchiro/mpv-winbuild-cmake
+          ref: master
+
+      - name: Checking out fork patches
+        uses: actions/checkout@main
+        with:
+          path: _fork
+
+      - name: Applying fork patches
+        run: bash _fork/fork/apply.sh
+
+      # The toolchain caches are keyed on upstream's LLVM recipe, so a changed recipe
+      # (e.g. a new LLVM release branch) rebuilds the toolchain instead of reusing a stale one.
+      - name: Loading clang sysroot cache
+        id: clang_root_cache
+        uses: actions/cache/restore@main
+        with:
+          path: |
+            clang_root
+          key: ${{ secrets.CACHE_VERSION }}-${{ hashFiles('toolchain/llvm/**') }}-clang_root-${{ github.run_id }}
+          restore-keys: |
+            ${{ secrets.CACHE_VERSION }}-${{ hashFiles('toolchain/llvm/**') }}-clang_root
+
+      - name: Loading repository cache
+        uses: actions/cache/restore@main
+        with:
+          path: src_packages
+          key: ${{ secrets.CACHE_VERSION }}-repository-${{ github.run_id }}
+          restore-keys: |
+            ${{ secrets.CACHE_VERSION }}-repository
+
+      - name: Loading x86_64_v3 toolchain cache
+        id: toolchain_cache
+        uses: actions/cache/restore@main
+        with:
+          path: |
+            build_x86_64_v3
+          key: ${{ secrets.CACHE_VERSION }}-${{ hashFiles('toolchain/llvm/**') }}-clang-x86_64_v3_toolchain-${{ github.run_id }}
+          restore-keys: |
+            ${{ secrets.CACHE_VERSION }}-${{ hashFiles('toolchain/llvm/**') }}-clang-x86_64_v3_toolchain
+
+      - name: Dropping cached sources that point at another remote
+        run: |
+          # libplacebo used to be fetched from a fork; the recipe now uses upstream plus a patch
+          dir=src_packages/libplacebo
+          if [ -d "$dir/.git" ] && [ "$(git -C "$dir" remote get-url origin 2>/dev/null)" != "https://github.com/haasn/libplacebo.git" ]; then
+            echo "Removing $dir (origin is not upstream)"
+            rm -rf "$dir"
+          fi
+
+      # ---- Toolchain: same steps as upstream's llvm_clang.yml, only run when a cache is missing ----
+      - name: Building LLVM with IR Profile Instrumentation
+        if: ${{ steps.clang_root_cache.outputs.cache-matched-key == '' }}
+        run: |
+          cmake -DTARGET_ARCH=x86_64-w64-mingw32 -DLLVM_ENABLE_PGO=GEN -DCOMPILER_TOOLCHAIN=clang -DCMAKE_INSTALL_PREFIX=$PWD/clang_root -DMINGW_INSTALL_PREFIX=$PWD/build_x86_64/x86_64-w64-mingw32 -DSINGLE_SOURCE_LOCATION=$PWD/src_packages -DRUSTUP_LOCATION=$PWD/clang_root/install_rustup -G Ninja -B build_x86_64 -S $PWD
+          ninja -C build_x86_64 llvm
+          ninja -C build_x86_64 rustup
+          ninja -C build_x86_64 cargo-clean
+
+      - name: Building x86_64 toolchain
+        if: ${{ steps.clang_root_cache.outputs.cache-matched-key == '' }}
+        run: |
+          cmake -DTARGET_ARCH=x86_64-w64-mingw32 -DLLVM_ENABLE_PGO=GEN -DCOMPILER_TOOLCHAIN=clang -DCMAKE_INSTALL_PREFIX=$PWD/clang_root -DMINGW_INSTALL_PREFIX=$PWD/build_x86_64/x86_64-w64-mingw32 -DSINGLE_SOURCE_LOCATION=$PWD/src_packages -DRUSTUP_LOCATION=$PWD/clang_root/install_rustup -G Ninja -B build_x86_64 -S $PWD
+          ninja -C build_x86_64 llvm-clang
+
+      - name: Building x86_64-v3 toolchain
+        if: ${{ steps.clang_root_cache.outputs.cache-matched-key == '' || steps.toolchain_cache.outputs.cache-matched-key == '' }}
+        run: |
+          cmake -DTARGET_ARCH=x86_64-w64-mingw32 -DLLVM_ENABLE_PGO=GEN -DCOMPILER_TOOLCHAIN=clang -DGCC_ARCH=x86-64-v3 -DCMAKE_INSTALL_PREFIX=$PWD/clang_root -DMINGW_INSTALL_PREFIX=$PWD/build_x86_64_v3/x86_64_v3-w64-mingw32 -DSINGLE_SOURCE_LOCATION=$PWD/src_packages -DRUSTUP_LOCATION=$PWD/clang_root/install_rustup -G Ninja -B build_x86_64_v3 -S $PWD
+          ninja -C build_x86_64_v3 llvm-clang
+
+      - name: PGO training with shaderc
+        if: ${{ steps.clang_root_cache.outputs.cache-matched-key == '' }}
+        run: |
+          cmake -DTARGET_ARCH=x86_64-w64-mingw32 -DLLVM_ENABLE_PGO=GEN -DCLANG_PACKAGES_LTO=ON -DCOMPILER_TOOLCHAIN=clang -DCMAKE_INSTALL_PREFIX=$PWD/clang_root -DMINGW_INSTALL_PREFIX=$PWD/build_x86_64/x86_64-w64-mingw32 -DSINGLE_SOURCE_LOCATION=$PWD/src_packages -DRUSTUP_LOCATION=$PWD/clang_root/install_rustup -G Ninja -B build_x86_64 -S $PWD
+          ninja -C build_x86_64 shaderc
+
+      - name: Merging profraw to profdata
+        if: ${{ steps.clang_root_cache.outputs.cache-matched-key == '' }}
+        run: |
+          llvm-profdata merge $PWD/clang_root/profiles/*.profraw -o llvm.profdata
+          rm -rf $PWD/clang_root/profiles/* || true
+
+      - name: Building LLVM with PGO
+        if: ${{ steps.clang_root_cache.outputs.cache-matched-key == '' }}
+        run: |
+          cmake -DTARGET_ARCH=x86_64-w64-mingw32 -DLLVM_ENABLE_PGO=USE -DLLVM_PROFDATA_FILE="llvm.profdata" -DCOMPILER_TOOLCHAIN=clang -DCMAKE_INSTALL_PREFIX=$PWD/clang_root -DMINGW_INSTALL_PREFIX=$PWD/build_x86_64/x86_64-w64-mingw32 -DSINGLE_SOURCE_LOCATION=$PWD/src_packages -DRUSTUP_LOCATION=$PWD/clang_root/install_rustup -G Ninja -B build_x86_64 -S $PWD
+          ninja -C build_x86_64 llvm
+
+      - name: Cleaning up after the toolchain build
+        if: ${{ steps.clang_root_cache.outputs.cache-matched-key == '' || steps.toolchain_cache.outputs.cache-matched-key == '' }}
+        run: |
+          rm -rf build_x86_64_v3/{toolchain,packages} || true
+          # build_x86_64 only hosts the LLVM build and the PGO training, the mpv build does not need it
+          rm -rf build_x86_64 || true
+
+      # Saved right away so a later failure in the mpv build does not throw the toolchain away
+      - name: Saving fresh clang sysroot cache
+        if: ${{ steps.clang_root_cache.outputs.cache-matched-key == '' }}
+        uses: actions/cache/save@main
+        with:
+          path: |
+            clang_root
+          key: ${{ secrets.CACHE_VERSION }}-${{ hashFiles('toolchain/llvm/**') }}-clang_root-${{ github.run_id }}-0
+
+      - name: Saving fresh x86_64_v3 toolchain cache
+        if: ${{ steps.clang_root_cache.outputs.cache-matched-key == '' || steps.toolchain_cache.outputs.cache-matched-key == '' }}
+        uses: actions/cache/save@main
+        with:
+          path: |
+            build_x86_64_v3
+          key: ${{ secrets.CACHE_VERSION }}-${{ hashFiles('toolchain/llvm/**') }}-clang-x86_64_v3_toolchain-${{ github.run_id }}-0
+
+      # ---- mpv: same steps as upstream's mpv_clang.yml for x86_64_v3 ----
+      - name: Configuring CMake & Downloading source
+        run: |
+          cmake -DTARGET_ARCH=x86_64-w64-mingw32 -DCOMPILER_TOOLCHAIN=clang -DGCC_ARCH=x86-64-v3 -DCMAKE_INSTALL_PREFIX=$PWD/clang_root -DMINGW_INSTALL_PREFIX=$PWD/build_$BIT/$BIT-w64-mingw32 -DSINGLE_SOURCE_LOCATION=$PWD/src_packages -DRUSTUP_LOCATION=$PWD/clang_root/install_rustup -DENABLE_CCACHE=ON -DCLANG_PACKAGES_LTO=ON -G Ninja --fresh -B build_$BIT -S $PWD
+          ninja -C build_$BIT download || true
+
+      - name: Building mpv
+        run: |
+          ninja -C build_$BIT update
+          ninja -C build_$BIT mpv
+
+      - name: Packaging mpv
+        run: |
+          mkdir -p release_$BIT
+          ninja -C build_$BIT mpv-packaging; mv build_$BIT/mpv*.7z release_$BIT
+
+      - name: Copying ffmpeg
+        run: |
+          hash=$(git -C src_packages/ffmpeg rev-parse --short HEAD)
+          7z a -m0=lzma2 -mx=9 -ms=on release_$BIT/ffmpeg-x86_64-v3-git-$hash.7z ./build_$BIT/$BIT-w64-mingw32/bin/ffmpeg.exe
+
+      - name: Collecting logs
+        if: always()
+        run: |
+          mkdir -p build_${BIT}_logs
+          cp -fr $(find build_$BIT build_x86_64 -type f -iname "*-*.log" -or -wholename "*/ffbuild/config.log" 2>/dev/null) build_${BIT}_logs || true
+          7z a -m0=lzma2 -mx=9 -ms=on logs.7z build*logs
+
+      - name: Uploading logs
+        uses: actions/upload-artifact@master
+        if: always()
+        with:
+          name: mpv-x86_64_v3-logs
+          path: logs.7z
+          retention-days: 3
+
+      - name: Uploading x86_64_v3 build
+        uses: actions/upload-artifact@master
+        with:
+          name: mpv-x86_64_v3
+          path: release_x86_64_v3/mpv-x86_64*
+
+      - name: Cleaning build directory
+        run: |
+          rm -rf build_$BIT/mpv*
+          rm -rf release_$BIT/mpv-debug*.7z
+
+      - name: Cleaning rust toolchain directory
+        run: |
+          ninja -C build_$BIT cargo-clean
+
+      # Only saved after a successful build, so a broken tree never becomes the newest cache
+      - name: Saving clang sysroot cache
+        uses: actions/cache/save@main
+        with:
+          path: |
+            clang_root
+          key: ${{ secrets.CACHE_VERSION }}-${{ hashFiles('toolchain/llvm/**') }}-clang_root-${{ github.run_id }}-1
+
+      - name: Saving repository cache
+        uses: actions/cache/save@main
+        with:
+          path: src_packages
+          key: ${{ secrets.CACHE_VERSION }}-repository-${{ github.run_id }}
+
+      - name: Saving x86_64_v3 toolchain cache
+        uses: actions/cache/save@main
+        with:
+          path: |
+            build_x86_64_v3
+          key: ${{ secrets.CACHE_VERSION }}-${{ hashFiles('toolchain/llvm/**') }}-clang-x86_64_v3_toolchain-${{ github.run_id }}-1
+
+      - name: Saving release_x86_64_v3 cache
+        uses: actions/cache/save@main
+        with:
+          path: release_x86_64_v3
+          key: ${{ secrets.CACHE_VERSION }}-release_x86_64_v3-${{ github.run_id }}
+
+  release:
+    name: Upload release
+    runs-on: ubuntu-latest
+    needs: build_mpv
+    env:
+      GH_TOKEN: ${{ github.token }}
+      CURL_RETRIES: "--connect-timeout 60 --retry 999 --retry-delay 5 --retry-all-errors"
+      release_key: ${{ secrets.CACHE_VERSION }}-release_x86_64_v3-${{ github.run_id }}
+      API: https://api.github.com/repos/${{ github.repository }}
+    container:
+      image: docker://alpine:latest
+
+    steps:
+      - name: Installing dependencies
+        shell: sh
+        run: |
+          apk add --update --no-cache bash file curl tar zstd jq
+
+      - name: Loading release_x86_64_v3 cache
+        uses: actions/cache/restore@main
+        with:
+          path: release_x86_64_v3
+          key: ${{ env.release_key }}
+          fail-on-cache-miss: true
+
+      - name: Uploading packages to Github release
+        id: upload_packages_gh
+        if: ${{ github.event_name == 'schedule' || github.event.inputs.github_release == 'true' }}
+        run: |
+          tag=$(date "+%Y%m%d")
+          ls -lh release_x86_64_v3
+          # A second build on the same day reuses that day's release
+          id=$(curl -u x-access-token:$GH_TOKEN $CURL_RETRIES -s -H "Accept: application/vnd.github.v3+json" $API/releases/tags/$tag | jq -r '.id // empty')
+          if [ -z "$id" ]; then
+            body="**Workflow run**: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            id=$(jq -n --arg tag "$tag" --arg body "$body" '{tag_name: $tag, name: $tag, body: $body}' | curl -u x-access-token:$GH_TOKEN $CURL_RETRIES -s -X POST -H "Accept: application/vnd.github.v3+json" $API/releases -d @- | jq -r '.id // empty')
+          else
+            # drop the assets of the earlier build so the release only holds the newest one
+            for asset in $(curl -u x-access-token:$GH_TOKEN $CURL_RETRIES -s -H "Accept: application/vnd.github.v3+json" $API/releases/$id/assets | jq -r '.[].id'); do
+              curl -u x-access-token:$GH_TOKEN $CURL_RETRIES -s -o /dev/null -X DELETE -H "Accept: application/vnd.github.v3+json" $API/releases/assets/$asset
+            done
+          fi
+          [ -n "$id" ] || { echo "Could not create or find release $tag"; exit 1; }
+          uploads=https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$id/assets
+          for file in release_x86_64_v3/*.7z; do
+            curl -u x-access-token:$GH_TOKEN $CURL_RETRIES -s -o /dev/null -w "%{http_code} $(basename $file)\n" -X POST -H "Accept: application/vnd.github.v3+json" -H "Content-Type: $(file -b --mime-type $file)" "$uploads?name=$(basename $file)" --data-binary @$file
+          done
+
+      - name: Pruning old releases
+        if: ${{ steps.upload_packages_gh.outcome == 'success' }}
+        continue-on-error: true
+        run: |
+          # Keep the newest 12 releases, delete older ones together with their tags
+          curl -u x-access-token:$GH_TOKEN $CURL_RETRIES -s -H "Accept: application/vnd.github.v3+json" "$API/releases?per_page=100" | jq -r 'sort_by(.created_at) | reverse | .[12:][] | "\(.id) \(.tag_name)"' | while read -r id tag; do
+            echo "Deleting release $tag"
+            curl -u x-access-token:$GH_TOKEN $CURL_RETRIES -s -o /dev/null -X DELETE -H "Accept: application/vnd.github.v3+json" $API/releases/$id
+            curl -u x-access-token:$GH_TOKEN $CURL_RETRIES -s -o /dev/null -X DELETE -H "Accept: application/vnd.github.v3+json" $API/git/refs/tags/$tag
+          done
+
+      - name: Deleting release cache
+        if: always()
+        continue-on-error: true
+        run: |
+          curl -u x-access-token:$GH_TOKEN $CURL_RETRIES -s -o /dev/null -X DELETE -H "Accept: application/vnd.github.v3+json" "$API/actions/caches?key=$release_key"
+
+      - name: Syncing the fork with upstream
+        continue-on-error: true
+        run: |
+          # Fast-forwards/merges shinchiro's master into this fork so the repository itself stays
+          # current. The build does not depend on it (it always checks out upstream directly).
+          # GitHub refuses this for the workflow token when upstream changed its workflow files;
+          # in that case use "Sync fork" on the repository page.
+          curl -u x-access-token:$GH_TOKEN --connect-timeout 60 -s -X POST -H "Accept: application/vnd.github.v3+json" $API/merge-upstream -d '{"branch":"master"}' | jq -r '.message // .'
+
+      - name: Keeping the schedule alive
+        continue-on-error: true
+        run: |
+          # GitHub disables scheduled workflows after 60 days without repository activity;
+          # re-enabling the workflow resets that timer.
+          curl -u x-access-token:$GH_TOKEN --connect-timeout 60 -s -o /dev/null -w "%{http_code}\n" -X PUT -H "Accept: application/vnd.github.v3+json" $API/actions/workflows/auto_build.yml/enable

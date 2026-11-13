@@ -1,0 +1,68 @@
+From 9d4a723ca342d686742b5306919f8dc9c376bf6a Mon Sep 17 00:00:00 2001
+From: andrizan <putra7a@gmail.com>
+Date: Fri, 13 Nov 2026 10:19:06 +0700
+Subject: [PATCH] fix(updater): fetch builds from the
+ andrizan/mpv-winbuild-cmake releases
+
+The updater read shinchiro's GitHub releases (daily) and SourceForge project (weekly), so running it replaced a fork build with the official one. Read the latest GitHub release of andrizan/mpv-winbuild-cmake for both channels and for ffmpeg.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ mpv-root/installer/updater.ps1 | 34 +++++++---------------------------
+ 1 file changed, 7 insertions(+), 27 deletions(-)
+
+diff --git a/mpv-root/installer/updater.ps1 b/mpv-root/installer/updater.ps1
+index 8873191..2c3d4c7 100644
+--- a/mpv-root/installer/updater.ps1
++++ b/mpv-root/installer/updater.ps1
+@@ -104,32 +104,12 @@ function Extract-Archive ($file) {
+ function Get-Latest-Mpv($Arch, $channel) {
+     $filename = ""
+     $download_link = ""
+-    switch -wildcard ($channel) {
+-        "daily" {
+-            $api_gh = "https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/latest"
+-            $json = Invoke-WebRequest $api_gh -MaximumRedirection 0 -ErrorAction Ignore -UseBasicParsing | ConvertFrom-Json
+-            $filename = $json.assets | where { $_.name -Match "mpv-$Arch" } | Select-Object -ExpandProperty name
+-            $download_link = $json.assets | where { $_.name -Match "mpv-$Arch" } | Select-Object -ExpandProperty browser_download_url
+-        }
+-        "weekly" {
+-            $i686_link = "https://sourceforge.net/projects/mpv-player-windows/rss?path=/32bit"
+-            $x86_64_link = "https://sourceforge.net/projects/mpv-player-windows/rss?path=/64bit"
+-            $x86_64v3_link = "https://sourceforge.net/projects/mpv-player-windows/rss?path=/64bit-v3"
+-            $rss_link = ''
+-            switch ($Arch)
+-            {
+-                i686 { $rss_link = $i686_link}
+-                x86_64 { $rss_link = $x86_64_link }
+-                x86_64-v3 { $rss_link = $x86_64v3_link }
+-            }
+-            Write-Host "Fetching RSS feed for mpv" -ForegroundColor Green
+-            $result = [xml](New-Object System.Net.WebClient).DownloadString($rss_link)
+-            $latest = $result.rss.channel.item.link[0]
+-            $tempname = $latest.split("/")[-2]
+-            $filename = [System.Uri]::UnescapeDataString($tempname)
+-            $download_link = "https://download.sourceforge.net/mpv-player-windows/" + $filename
+-        }
+-    }
++    # Fork: builds are only published as GitHub releases of andrizan/mpv-winbuild-cmake
++    # (no SourceForge mirror), so both the weekly and the daily channel read from there.
++    $api_gh = "https://api.github.com/repos/andrizan/mpv-winbuild-cmake/releases/latest"
++    $json = Invoke-WebRequest $api_gh -MaximumRedirection 0 -ErrorAction Ignore -UseBasicParsing | ConvertFrom-Json
++    $filename = $json.assets | where { $_.name -Match "mpv-$Arch" } | Select-Object -ExpandProperty name
++    $download_link = $json.assets | where { $_.name -Match "mpv-$Arch" } | Select-Object -ExpandProperty browser_download_url
+     if ($filename -is [array]) {
+         return $filename[0], $download_link[0]
+     }
+@@ -160,7 +140,7 @@ function Get-Latest-Ytplugin ($plugin) {
+ }
+ 
+ function Get-Latest-FFmpeg ($Arch) {
+-    $api_gh = "https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/latest"
++    $api_gh = "https://api.github.com/repos/andrizan/mpv-winbuild-cmake/releases/latest"
+     $json = Invoke-WebRequest $api_gh -MaximumRedirection 0 -ErrorAction Ignore -UseBasicParsing | ConvertFrom-Json
+     $filename = $json.assets | where { $_.name -Match "ffmpeg-$Arch" } | Select-Object -ExpandProperty name
+     $download_link = $json.assets | where { $_.name -Match "ffmpeg-$Arch" } | Select-Object -ExpandProperty browser_download_url
+-- 
+2.56.0.windows.4
+

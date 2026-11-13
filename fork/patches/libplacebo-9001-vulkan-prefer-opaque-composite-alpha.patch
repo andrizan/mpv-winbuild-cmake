@@ -1,0 +1,37 @@
+From 37a9231f70f9588f44071077b3fd196ebbe0ee28 Mon Sep 17 00:00:00 2001
+From: andrizan <putra7a@gmail.com>
+Date: Thu, 12 Nov 2026 17:29:18 +0700
+Subject: [PATCH] fix(vulkan): prefer opaque composite alpha unless alpha bits
+ are requested
+
+The swapchain always picked a blended composite alpha mode when the driver offered one. Recent NVIDIA drivers on Windows offer VK_COMPOSITE_ALPHA_PRE_MULTIPLIED, so an opaque player window turned see-through once the NVIDIA overlay attached to the process and the presented alpha was no longer 1. Pick VK_COMPOSITE_ALPHA_OPAQUE when pl_vulkan_swapchain_params.alpha_bits is 0 and the surface supports it; callers that want a transparent window already set alpha_bits.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ src/vulkan/swapchain.c | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/src/vulkan/swapchain.c b/src/vulkan/swapchain.c
+index c4b69522..609e7f54 100644
+--- a/src/vulkan/swapchain.c
++++ b/src/vulkan/swapchain.c
+@@ -594,7 +594,16 @@ caps_ready:
+         {VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR,         PL_ALPHA_UNKNOWN},
+     };
+ 
++    // Only let the compositor blend the swapchain's alpha channel if the user
++    // asked for alpha bits. Otherwise the window is meant to be opaque, and a
++    // blended mode makes it translucent as soon as anything else (e.g. an
++    // overlay hooking the present path) leaves alpha below 1.
++    const bool opaque_only = !p->params.alpha_bits &&
++        (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR);
++
+     for (int i = 0; i < PL_ARRAY_SIZE(alphaModes); i++) {
++        if (opaque_only && alphaModes[i].vk_mode != VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR)
++            continue;
+         if (caps.supportedCompositeAlpha & alphaModes[i].vk_mode) {
+             info->compositeAlpha = alphaModes[i].vk_mode;
+             p->color_repr.alpha = alphaModes[i].pl_mode;
+-- 
+2.56.0.windows.4
+
